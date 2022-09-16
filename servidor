@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+import asyncio
+from ip import IP
+from camadafisica import PTY
+from slip import CamadaEnlace
+from tcp import Servidor
+import re
+
+connected_users = {}
+channels = {}
+
+
+def validar_nome(nome):
+    return re.match(rb"^[a-zA-Z][a-zA-Z0-9_-]*$", nome) is not None
+
+
+def validar_canal(canal):
+    return re.match(rb"^\#[a-zA-Z][a-zA-Z0-9_-]*$", canal) is not None
+
+
+def sair(conexao):
+    user_channels = list(filter(lambda channel: conexao in channel, channels.values()))
+    users = set([item for sub in user_channels for item in sub])
+    users.remove(conexao)
+
+    for user in users:
+        user.enviar(b":%s QUIT :Connection closed\r\n" % conexao.nick)
+
+    del connected_users[conexao.nick]
+
+    for key, value in channels.items():
+        if conexao in value:
+            channels[key].remove(conexao)
+
+    print(conexao, "conexão fechada")
+    conexao.fechar()
+
+
+def dados_recebidos(conexao, dados):
+    if dados == b"":
+        return sair(conexao)
+
+    print(conexao, dados)
+    dados = conexao.residual + dados
+
+    commands = dados.split(b"\n")
+
+    if commands[-1] != b"":
+        conexao.residual = commands[-1]
+
+    for input in commands[:-1]:
+        command, payload = input.split(b" ", 1)
+
+        handle_command(conexao, command, payload)
+
+
+def handle_command(conexao, command, payload):
+    if command == b"PING":
+        conexao.enviar(b":server PONG server :" + payload + b"\r\n")
+    elif command == b"NICK":
+        nick = payload.lower()
+
+        if not validar_nome(nick):
+            conexao.enviar(b":server 432 * %s :Erroneous nickname\r\n" % payload),
+            return
+
+        if nick in connected_users:
+            conexao.enviar(
+                b":server 433 %s %s :Nickname is already in use\r\n"
+                % (conexao.nick or b"*", payload)
+            )
+        else:
+            if conexao.nick == b"":
+                conexao.enviar(b":server 001 %s :Welcome\r\n" % payload),
+                conexao.enviar(b":server 422 %s :MOTD File is missing\r\n" % payload)
+            else:
+                conexao.enviar(b":%s NICK %s\r\n" % (conexao.nick, payload))
+                del connected_users[conexao.nick]
+
+            connected_users[nick] = conexao
+            conexao.nick = nick
+    elif command == b"PRIVMSG":
+        nick, message = payload.split(b" ", 1)
+
+        if nick.startswith(b"#") and nick.lower() in channels:
+            for connection in channels[nick.lower()]:
+                if connection != conexao:
+                    connection.enviar(
+                        b":%s PRIVMSG %s %s\r\n" % (conexao.nick, nick, message)
+                    )
+
+            return
+
+        if nick.lower() in connected_users:
+            connected_users[nick.lower()].enviar(
+                b":%s PRIVMSG %s %s\r\n" % (conexao.nick, nick, message)
+            )
+    elif command == b"JOIN":
+        channel = payload.lower()
+
+        if not validar_canal(channel):
+            conexao.enviar(b":server 403 %s :No such channel\r\n" % channel)
+            return
+
+        if channel in channels:
+            channels[channel].append(conexao)
+        else:
+            channels[channel] = [conexao]
+
+        for connection in channels[channel]:
+            connection.enviar(b":%s JOIN :%s\r\n" % (conexao.nick, channel)),
+
+        channel_users = list(map(lambda conexao: conexao.nick, channels[channel]))
+        channel_users.sort()
+        conexao.enviar(
+            b":server 353 %s = %s :%s\r\n"
+            % (conexao.nick, channel, b" ".join(channel_users))
+        )
+        conexao.enviar(
+            b":server 366 %s %s :End of /NAMES list.\r\n" % (conexao.nick, channel)
+        )
+
+    elif command == b"PART":
+        channel = payload.split(b" ")[0].lower()
+
+        if channel.lower() in channels:
+            for connection in channels[channel.lower()]:
+                connection.enviar(b":%s PART %s\r\n" % (conexao.nick, channel))
+
+            channels[channel].remove(conexao)
+
+
+def conexao_aceita(conexao):
+    print(conexao, "nova conexão")
+    conexao.nick = b""
+    conexao.residual = b""
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+linha_serial = PTY()
+outra_ponta = "192.168.123.1"
+nossa_ponta = "192.168.123.2"
+
+print("Para conectar a outra ponta da camada física, execute:")
+print("  sudo slattach -v -p slip {}".format(linha_serial.pty_name))
+print("  sudo ifconfig sl0 {} pointopoint {}".format(outra_ponta, nossa_ponta))
+print()
+print("O serviço ficará acessível no endereço {}".format(nossa_ponta))
+print()
+
+enlace = CamadaEnlace({outra_ponta: linha_serial})
+rede = IP(enlace)
+rede.definir_endereco_host(nossa_ponta)
+rede.definir_tabela_encaminhamento([("0.0.0.0/0", outra_ponta)])
+servidor = Servidor(rede, 7000)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
